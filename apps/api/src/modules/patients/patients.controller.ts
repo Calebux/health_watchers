@@ -1,7 +1,10 @@
 import { Router, Request, Response } from 'express';
 import { PatientModel } from './models/patient.model';
 import { PatientCounterModel } from './models/patient-counter.model';
+import { ImportLogModel } from './models/import-log.model';
 import { toPatientResponse } from './patients.transformer';
+import multer from 'multer';
+import { parse } from 'csv-parse';
 import { asyncHandler } from '../../utils/asyncHandler';
 import { paginate, parsePagination } from '../../utils/paginate';
 import { authenticate, requireRoles } from '@api/middlewares/auth.middleware';
@@ -20,6 +23,17 @@ import {
 import { cacheResponse } from '@api/middlewares/cache.middleware';
 import { cache } from '@api/services/cache.service';
 import { CarePlanModel } from '../care-plans/care-plan.model';
+
+const upload = multer({
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only CSV files are allowed'));
+    }
+  },
+});
 
 const router = Router();
 router.use(authenticate);
@@ -47,14 +61,25 @@ function calcTrend(values: number[]): 'improving' | 'stable' | 'worsening' {
   return delta < 0 ? 'improving' : 'worsening';
 }
 
-async function nextSystemId(clinicId: string): Promise<string> {
+async function nextSystemId(clinicId: string, count = 1): Promise<string | number> {
   const counter = await PatientCounterModel.findOneAndUpdate(
     { _id: clinicId },
-    { $inc: { value: 1 } },
+    { $inc: { value: count } },
     { new: true, upsert: true }
   );
+  
+  if (count > 1) {
+    return counter!.value - count + 1; // Return the start of the range
+  }
+
   const short = clinicId.slice(-6).toUpperCase();
   const padded = String(counter!.value).padStart(6, '0');
+  return `HW-${short}-${padded}`;
+}
+
+function formatSystemId(clinicId: string, value: number): string {
+  const short = clinicId.slice(-6).toUpperCase();
+  const padded = String(value).padStart(6, '0');
   return `HW-${short}-${padded}`;
 }
 
@@ -102,6 +127,165 @@ router.get(
     return res.json({
       status: 'success',
       data: result.data.map(toPatientResponse),
+      meta: result.meta,
+    });
+  })
+);
+
+// POST /patients/import — CLINIC_ADMIN only
+router.post(
+  '/import',
+  ADMIN_ROLES,
+  upload.single('file'),
+  asyncHandler(async (req: Request, res: Response) => {
+    if (!req.file) {
+      return res.status(400).json({ error: 'BadRequest', message: 'No file uploaded' });
+    }
+
+    const clinicId = req.user!.clinicId;
+    const userId = req.user!._id;
+    const filename = req.file.originalname;
+
+    // Create initial log
+    const log = await ImportLogModel.create({
+      clinicId,
+      importedBy: userId,
+      filename,
+      status: 'processing',
+    });
+
+    const results = {
+      total: 0,
+      imported: 0,
+      skipped: 0,
+      errors: [] as Array<{ row: number; field?: string; error: string }>,
+    };
+
+    const parser = parse(req.file.buffer, {
+      columns: true,
+      skip_empty_lines: true,
+      trim: true,
+      max_record_size: 10000,
+    });
+
+    let rowNumber = 1; // including header as row 0 (columns: true starts at data)
+    let batch: any[] = [];
+    const MAX_ERRORS = 100;
+
+    try {
+      for await (const record of parser) {
+        rowNumber++;
+        results.total++;
+
+        // 1. Validate
+        const validation = createPatientSchema.safeParse(record);
+        if (!validation.success) {
+          const firstError = validation.error.errors[0];
+          results.errors.push({
+            row: rowNumber,
+            field: String(firstError.path[0] || ''),
+            error: firstError.message,
+          });
+          if (results.errors.length >= MAX_ERRORS) {
+            log.status = 'aborted';
+            break;
+          }
+          continue;
+        }
+
+        const data = validation.data;
+
+        // 2. Duplicate Detection (Name + DOB)
+        const searchName = `${data.firstName} ${data.lastName}`.toLowerCase();
+        const dob = new Date(data.dateOfBirth);
+        const exists = await PatientModel.exists({
+          clinicId,
+          searchName,
+          dateOfBirth: dob,
+          isActive: true,
+        });
+
+        if (exists) {
+          results.skipped++;
+          continue;
+        }
+
+        // 3. Queue for Batch Processing
+        batch.push({
+          ...data,
+          dateOfBirth: dob,
+          clinicId,
+          searchName,
+          isActive: true,
+        });
+
+        if (batch.length >= 100) {
+          await processBatch(batch, clinicId);
+          results.imported += batch.length;
+          batch = [];
+        }
+      }
+
+      // Process remaining
+      if (batch.length > 0 && log.status !== 'aborted') {
+        await processBatch(batch, clinicId);
+        results.imported += batch.length;
+      }
+
+      // Finalize log
+      log.totalRows = results.total;
+      log.importedCount = results.imported;
+      log.skippedCount = results.skipped;
+      log.errorCount = results.errors.length;
+      log.errors = results.errors;
+      log.status = log.status === 'aborted' ? 'aborted' : 'completed';
+      log.completedAt = new Date();
+      await log.save();
+
+      return res.json({
+        status: 'success',
+        data: {
+          importId: log._id,
+          summary: results,
+        },
+      });
+    } catch (error: any) {
+      log.status = 'failed';
+      await log.save();
+      return res.status(500).json({ error: 'InternalServerError', message: error.message });
+    }
+  })
+);
+
+/** Helper to process a batch of patients with system ID generation */
+async function processBatch(patients: any[], clinicId: string) {
+  const startValue = (await nextSystemId(clinicId, patients.length)) as number;
+  const operations = patients.map((p, index) => ({
+    ...p,
+    systemId: formatSystemId(clinicId, startValue + index),
+  }));
+  await PatientModel.insertMany(operations);
+}
+
+// GET /patients/import-history
+router.get(
+  '/import-history',
+  ADMIN_ROLES,
+  asyncHandler(async (req: Request, res: Response) => {
+    const pagination = parsePagination(req.query as Record<string, unknown>);
+    const { page, limit } = pagination || { page: 1, limit: 10 };
+
+    const result = await paginate(
+      ImportLogModel,
+      { clinicId: req.user!.clinicId },
+      page,
+      limit,
+      { createdAt: -1 }
+    );
+
+    return res.json({
+      status: 'success',
+      data: result.data,
       meta: result.meta,
     });
   })

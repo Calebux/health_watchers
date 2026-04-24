@@ -2,10 +2,13 @@
 
 import { useState, useRef } from 'react';
 import Link from 'next/link';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { type Patient, formatDate } from '@health-watchers/types';
 import { ErrorMessage, TableSkeleton, ModuleEmptyState } from '@/components/ui';
 import { queryKeys } from '@/lib/queryKeys';
+import { API_URL } from '@/lib/api';
+import PatientImportModal from './PatientImportModal';
+import { useAuth } from '@/context/AuthContext';
 
 interface Labels {
   title: string;
@@ -21,11 +24,14 @@ interface Labels {
   registerNew: string;
 }
 
-import { API_URL } from '@/lib/api';
-
 export default function PatientsClient({ labels }: { labels: Labels }) {
+  const { user } = useAuth();
+  const queryClient = useQueryClient();
   const [searchQuery, setSearchQuery] = useState('');
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const debounceTimer = useRef<NodeJS.Timeout>();
+
+  const isAtLeastAdmin = user?.role === 'CLINIC_ADMIN' || user?.role === 'SUPER_ADMIN';
 
   const {
     data: patients = [],
@@ -37,7 +43,9 @@ export default function PatientsClient({ labels }: { labels: Labels }) {
       const url = searchQuery
         ? `${API_URL}/api/v1/patients/search?q=${encodeURIComponent(searchQuery)}`
         : `${API_URL}/api/v1/patients`;
-      const res = await fetch(url);
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${localStorage.getItem('token')}` },
+      });
       if (!res.ok) throw new Error(`Request failed (${res.status})`);
       const data = await res.json();
       return data.data || [];
@@ -57,14 +65,33 @@ export default function PatientsClient({ labels }: { labels: Labels }) {
       {/* ── Page header ───────────────────────────────────── */}
       <div className="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <h1 className="text-2xl font-bold text-gray-900 sm:text-3xl">{labels.title}</h1>
-        <Link
-          href="/patients/new"
-          id="register-new-patient-btn"
-          className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 focus-visible:outline-none active:bg-blue-800"
-        >
-          <span aria-hidden="true">+</span>
-          {labels.registerNew}
-        </Link>
+        <div className="flex items-center gap-2">
+          {isAtLeastAdmin && (
+            <button
+              type="button"
+              onClick={() => setIsImportModalOpen(true)}
+              className="inline-flex items-center gap-2 rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 shadow-sm transition-colors hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
+            >
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"
+                />
+              </svg>
+              Import
+            </button>
+          )}
+          <Link
+            href="/patients/new"
+            id="register-new-patient-btn"
+            className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 focus-visible:outline-none active:bg-blue-800"
+          >
+            <span aria-hidden="true">+</span>
+            {labels.registerNew}
+          </Link>
+        </div>
       </div>
 
       {/* ── Search bar ────────────────────────────────────── */}
@@ -79,12 +106,13 @@ export default function PatientsClient({ labels }: { labels: Labels }) {
           aria-label={labels.search}
         />
       </div>
+
       {isLoading ? (
         <TableSkeleton columns={6} rows={5} />
       ) : error ? (
         <ErrorMessage
           message={error instanceof Error ? error.message : 'Failed to load patients.'}
-          onRetry={() => window.location.reload()}
+          onRetry={() => queryClient.invalidateQueries({ queryKey: queryKeys.patients.all })}
         />
       ) : patients.length === 0 ? (
         <ModuleEmptyState
@@ -177,6 +205,14 @@ export default function PatientsClient({ labels }: { labels: Labels }) {
           </div>
         </>
       )}
+
+      <PatientImportModal
+        open={isImportModalOpen}
+        onClose={() => setIsImportModalOpen(false)}
+        onSuccess={() => {
+          queryClient.invalidateQueries({ queryKey: queryKeys.patients.all });
+        }}
+      />
     </main>
   );
 }
